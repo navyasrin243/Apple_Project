@@ -20,12 +20,24 @@ st.markdown("""
 st.markdown('<div class="title">🍎 Apple Leaf Disease Detector</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Upload a leaf image to detect disease</div>', unsafe_allow_html=True)
 
-# ---------------- MODEL ----------------
+# ---------------- CLASS NAMES ----------------
 class_names = ["black_rot", "healthy", "rust", "scab"]
+
+# ---------------- DISEASE INFO ----------------
+disease_info = {
+    "scab": "Fungal disease causing dark lesions on leaves and fruit.",
+    "rust": "Causes yellow-orange spots on leaves.",
+    "black_rot": "Leads to rotting and dark patches.",
+    "healthy": "Leaf is healthy with no visible disease."
+}
+
+# ---------------- DEVICE ----------------
 device = torch.device("cpu")
 
+# ---------------- MODEL ----------------
 model = models.mobilenet_v2(weights=None)
 model.classifier[1] = nn.Linear(model.last_channel, 4)
+
 model.load_state_dict(torch.load("model.pth", map_location=device))
 model.eval()
 
@@ -37,7 +49,7 @@ val_tf = transforms.Compose([
                          [0.229,0.224,0.225])
 ])
 
-# ---------------- PREDICTION ----------------
+# ---------------- PREDICTION FUNCTION ----------------
 def predict(img):
     x = val_tf(img).unsqueeze(0)
 
@@ -64,22 +76,28 @@ if uploaded_file:
             try:
                 label, conf, probs = predict(img)
 
-                # Confidence threshold
+                # Confidence handling
                 if conf < 0.65:
                     st.warning("⚠️ Low confidence prediction")
                 else:
                     st.success("✅ Prediction complete")
 
+                # Prediction output
                 st.markdown(f"### 🧠 Prediction: **{label.upper()}**")
                 st.progress(int(conf * 100))
                 st.write(f"Confidence: {conf:.2f}")
 
+                # Disease info (safe)
+                if label in disease_info:
+                    st.info(disease_info[label])
+
+                # Probabilities
                 st.markdown("### 📊 Class Probabilities:")
                 for i, cls in enumerate(class_names):
                     st.write(f"{cls}: {probs[i]:.2f}")
 
             except:
-                st.error("❌ Invalid image. Try another.")
+                st.error("❌ Invalid image. Please upload a valid leaf image.")
 
 # ---------------- FOOTER ----------------
 st.markdown("---")
