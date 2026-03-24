@@ -4,48 +4,39 @@ from torchvision import transforms, models
 from PIL import Image
 import torch.nn as nn
 import os
+import numpy as np
+import cv2
 
 # ---------------- CONFIG ----------------
 st.set_page_config(page_title="Apple Disease Detector", layout="centered")
 
-# ---------------- STYLING ----------------
-st.markdown("""
-    <style>
-    .main {background-color: #f5f7fa;}
-    .title {text-align: center; font-size: 36px; font-weight: bold;}
-    .subtitle {text-align: center; color: gray; margin-bottom: 20px;}
-    </style>
-""", unsafe_allow_html=True)
-
 # ---------------- HEADER ----------------
-st.markdown('<div class="title">🍎 Apple Leaf Disease Detector</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">AI-powered disease detection with recommendations</div>', unsafe_allow_html=True)
+st.title("🍎 Apple Leaf Disease Detector")
+st.caption("AI-powered detection with explainability & severity estimation")
 
 # ---------------- CLASS NAMES ----------------
 class_names = ["black_rot", "healthy", "rust", "scab"]
 
-# ---------------- DISEASE INFO ----------------
+# ---------------- INFO ----------------
 disease_info = {
-    "scab": "Fungal disease causing dark lesions on leaves and fruit.",
-    "rust": "Causes yellow-orange spots on leaves.",
-    "black_rot": "Leads to rotting and dark patches.",
-    "healthy": "Leaf is healthy with no visible disease."
+    "scab": "Fungal disease causing dark lesions.",
+    "rust": "Yellow-orange spots on leaves.",
+    "black_rot": "Dark necrotic patches.",
+    "healthy": "No disease detected."
 }
 
-# ---------------- EXPLAINABLE AI ----------------
-explain = {
-    "scab": "Model detected irregular dark lesion patterns.",
-    "rust": "Model focused on yellow-orange clustered spots.",
-    "black_rot": "Model identified dark necrotic regions.",
-    "healthy": "No abnormal patterns detected."
-}
-
-# ---------------- TREATMENT ----------------
 treatment = {
-    "scab": "Use fungicides like captan or myclobutanil. Remove infected leaves.",
-    "rust": "Apply sulfur sprays. Avoid nearby juniper plants.",
-    "black_rot": "Prune infected areas and apply fungicide regularly.",
-    "healthy": "No treatment needed. Maintain regular care."
+    "scab": "Apply fungicides like captan.",
+    "rust": "Use sulfur sprays.",
+    "black_rot": "Prune infected areas.",
+    "healthy": "No action needed."
+}
+
+explain = {
+    "scab": "Irregular dark lesions detected.",
+    "rust": "Clustered orange spots detected.",
+    "black_rot": "Dark decaying regions found.",
+    "healthy": "No abnormal patterns."
 }
 
 # ---------------- DEVICE ----------------
@@ -59,7 +50,7 @@ model_path = os.path.join(os.path.dirname(__file__), "model.pth")
 model.load_state_dict(torch.load(model_path, map_location=device))
 model.eval()
 
-# ---------------- TRANSFORMS ----------------
+# ---------------- TRANSFORM ----------------
 val_tf = transforms.Compose([
     transforms.Resize((224,224)),
     transforms.ToTensor(),
@@ -67,28 +58,93 @@ val_tf = transforms.Compose([
                          [0.229,0.224,0.225])
 ])
 
-# ---------------- FUNCTIONS ----------------
+# ---------------- PREDICT ----------------
 def predict(img):
     x = val_tf(img).unsqueeze(0)
     with torch.no_grad():
         out = model(x)
         probs = torch.softmax(out, dim=1)
         conf, pred = torch.max(probs,1)
-    return class_names[pred.item()], conf.item(), probs.numpy()[0]
+    return class_names[pred.item()], conf.item(), probs.numpy()[0], out
 
-def get_severity(conf):
-    if conf < 0.5:
-        return "Low"
-    elif conf < 0.75:
-        return "Moderate"
+# ---------------- TRUE SEVERITY ----------------
+def calculate_severity(img):
+    img = img.resize((224,224))
+    img_np = np.array(img)
+
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+
+    lower = np.array([10, 50, 50])
+    upper = np.array([35, 255, 255])
+
+    mask = cv2.inRange(hsv, lower, upper)
+
+    ratio = np.sum(mask > 0) / mask.size
+
+    if ratio < 0.05:
+        return "Low", ratio
+    elif ratio < 0.15:
+        return "Moderate", ratio
     else:
-        return "High"
+        return "High", ratio
 
-# ---------------- INFO ----------------
-st.info("Upload a clear apple leaf image for best results.")
+# ---------------- GRADCAM ----------------
+def generate_gradcam(img, model, target_layer):
+    model.eval()
+    gradients = []
+    activations = []
 
-# ---------------- FILE UPLOAD ----------------
-uploaded_file = st.file_uploader("📤 Upload Leaf Image", type=["jpg","png","jpeg"])
+    def forward_hook(module, inp, out):
+        activations.append(out)
+
+    def backward_hook(module, grad_in, grad_out):
+        gradients.append(grad_out[0])
+
+    handle_f = target_layer.register_forward_hook(forward_hook)
+    handle_b = target_layer.register_full_backward_hook(backward_hook)
+
+    x = val_tf(img).unsqueeze(0)
+    out = model(x)
+    pred = out.argmax()
+
+    model.zero_grad()
+    out[0, pred].backward()
+
+    grads = gradients[0][0].detach().numpy()
+    acts = activations[0][0].detach().numpy()
+
+    weights = np.mean(grads, axis=(1,2))
+    cam = np.zeros(acts.shape[1:], dtype=np.float32)
+
+    for i, w in enumerate(weights):
+        cam += w * acts[i]
+
+    cam = np.maximum(cam, 0)
+    cam = cv2.resize(cam, (224,224))
+
+    cam = cam - cam.min()
+    if cam.max() != 0:
+        cam = cam / cam.max()
+
+    handle_f.remove()
+    handle_b.remove()
+
+    return cam
+
+def overlay_cam(img, cam):
+    img = img.resize((224,224))
+    img_np = np.array(img)
+
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+    overlay = 0.5 * heatmap + 0.5 * img_np
+    return overlay.astype(np.uint8)
+
+# ---------------- UI ----------------
+st.info("Upload a clear apple leaf image")
+
+uploaded_file = st.file_uploader("Upload Image", type=["jpg","png","jpeg"])
 
 if uploaded_file:
     try:
@@ -101,49 +157,44 @@ if uploaded_file:
         col1, col2 = st.columns(2)
 
         with col1:
-            st.image(img, caption="Uploaded Image", use_column_width=True)
+            st.image(img, caption="Input Image", use_column_width=True)
 
         with col2:
-            with st.spinner("🔍 Analyzing..."):
-                label, conf, probs = predict(img)
+            label, conf, probs, raw_out = predict(img)
 
-                # Confidence + severity
-                severity = get_severity(conf)
+            st.subheader(f"Prediction: {label.upper()}")
+            st.progress(int(conf * 100))
+            st.write(f"Confidence: {conf:.2f}")
 
-                st.markdown(f"### 🧠 Prediction: **{label.upper()}**")
-                st.progress(int(conf * 100))
-                st.write(f"Confidence: {conf:.2f}")
-                st.write(f"🔥 Severity: {severity}")
+            # severity
+            severity, ratio = calculate_severity(img)
+            st.write(f"🔥 Severity: {severity} ({ratio*100:.1f}%)")
 
-                # Confidence interpretation
-                if conf < 0.65:
-                    st.warning("⚠️ Low confidence prediction — model unsure")
-                elif conf < 0.85:
-                    st.info("ℹ️ Moderate confidence")
-                else:
-                    st.success("✅ High confidence prediction")
+            # explanation
+            st.write("🧠 Why this prediction?")
+            st.info(explain[label])
 
-                # Disease info
-                if label in disease_info:
-                    st.info(disease_info[label])
+            # disease info
+            st.info(disease_info[label])
 
-                # Explainable AI
-                st.markdown("### 🧠 Why this prediction?")
-                st.info(explain[label])
+            # treatment
+            st.write("💊 Treatment")
+            st.success(treatment[label])
 
-                # Treatment
-                if label in treatment:
-                    st.markdown("### 💊 Treatment Recommendation")
-                    st.success(treatment[label])
+            # probabilities
+            st.write("📊 Class Probabilities:")
+            for i, cls in enumerate(class_names):
+                st.write(f"{cls}: {probs[i]:.2f}")
 
-                # Probabilities
-                st.markdown("### 📊 Class Probabilities:")
-                for i, cls in enumerate(class_names):
-                    st.write(f"{cls}: {probs[i]:.2f}")
+        # Grad-CAM
+        st.markdown("### 🔍 Model Attention (Grad-CAM)")
+        cam = generate_gradcam(img, model, model.features[-1])
+        overlay = overlay_cam(img, cam)
+        st.image(overlay, caption="Red = model focus", use_column_width=True)
 
-    except Exception:
-        st.error("❌ Invalid or corrupted image. Please upload a proper leaf image.")
+    except:
+        st.error("Invalid image file")
 
 # ---------------- FOOTER ----------------
 st.markdown("---")
-st.markdown("Built with ❤️ using Deep Learning")
+st.caption("Built using Deep Learning with Explainable AI")
