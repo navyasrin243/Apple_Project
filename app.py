@@ -8,24 +8,31 @@ import cv2
 import pandas as pd
 import plotly.express as px
 
-# --- 1. CONFIGURATION ---
-CLASS_NAMES = ["black_rot", "healthy", "rust", "scab"]
-
-# Decision Database
-STRATEGY_DB = {
-    "scab": {"med": "Mancozeb", "org": "Neem Oil", "base_price": 650, "risk_temp": 22},
-    "rust": {"med": "Myclobutanil", "org": "Sulfur", "base_price": 1100, "risk_temp": 25},
-    "black_rot": {"med": "Captan", "org": "Copper Soap", "base_price": 850, "risk_temp": 28},
-    "healthy": {"med": "N/A", "org": "Nutrients", "base_price": 150, "risk_temp": 0}
+# --- 1. RESEARCH-GRADE TREATMENT DATABASE ---
+TREATMENT_PLAN = {
+    "scab": {
+        "Low": "🌿 **Organic Detection:** Spray 1% Potassium Bicarbonate. Prune shaded inner branches to improve airflow.",
+        "Medium": "⚠️ **Standard Treatment:** Apply Mancozeb (2g/L). Repeat after 14 days if humidity remains >70%.",
+        "High": "🚨 **Emergency Action:** Use Myclobutanil (40WP) immediately. Burn heavily infected fallen leaves to stop spore cycle."
+    },
+    "rust": {
+        "Low": "🌿 **Organic Detection:** Apply Neem Oil (5ml/L) at sunset. Monitor nearby Cedar trees (alternate host).",
+        "Medium": "⚠️ **Standard Treatment:** Propiconazole (1ml/L). Ensure 100% coverage of both leaf surfaces.",
+        "High": "🚨 **Emergency Action:** Systemic Fungicide (Tilt 250 EC). Apply at 10-day intervals until new growth is clear."
+    },
+    "black_rot": {
+        "Low": "🌿 **Organic Detection:** Copper-based soap spray. Remove any 'mummy' fruits left from last season.",
+        "Medium": "⚠️ **Standard Treatment:** Captan 50 WP (2.5g/L). Focus application on the lower fruit clusters.",
+        "High": "🚨 **Emergency Action:** Flutriafol application. Aggressively prune and destroy infected wood cankers."
+    },
+    "healthy": {
+        "Low": "✅ **Optimal:** Maintain current mulch. Balanced NPK (10-10-10) application recommended.",
+        "Medium": "✅ **Optimal:** Add Calcium-Boron foliar spray to strengthen leaf cell walls against future fungi.",
+        "High": "✅ **Optimal:** Field health is excellent. Ensure irrigation does not wet the foliage directly."
+    }
 }
 
-# --- 2. MULTI-MODAL SIDEBAR (Sensors) ---
-st.sidebar.header("📡 Field Sensor Data (Multi-Modal)")
-humidity = st.sidebar.slider("Relative Humidity (%)", 30, 100, 75)
-temperature = st.sidebar.slider("Ambient Temperature (°C)", 10, 45, 24)
-st.sidebar.info("High humidity (>80%) accelerates fungal spore germination.")
-
-# --- 3. SHARPENED XAI ENGINE ---
+# --- 2. XAI ENGINE (Sharpened Grad-CAM) ---
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model, self.target_layer = model, target_layer
@@ -40,57 +47,52 @@ class GradCAM:
         try:
             self.model.zero_grad()
             self.model(x)[0, idx].backward()
-            grads = self.gradients.cpu().data.numpy()[0]
-            acts = self.activations.cpu().data.numpy()[0]
+            grads, acts = self.gradients.cpu().data.numpy()[0], self.activations.cpu().data.numpy()[0]
             weights = np.mean(grads, axis=(1, 2))
             cam = np.zeros(acts.shape[1:], dtype=np.float32)
             for i, w in enumerate(weights): cam += w * acts[i, :, :]
             cam = np.maximum(cam, 0)
-            cam = np.power(cam, 2) # Power Sharpening for spot accuracy
+            cam = np.power(cam, 2) # Sharpening spots
             cam = cv2.resize(cam, (224, 224))
             denom = cam.max() - cam.min()
             return (cam - cam.min()) / (denom if denom != 0 else 1e-8)
         finally:
             h1.remove(); h2.remove()
 
-# --- 4. MULTI-MODAL ANALYTICS ENGINE ---
-def analyze_multi_modal(img_pil, heatmap, label, hum, temp):
+# --- 3. MULTI-MODAL ANALYTICS ---
+def run_analytics(img_pil, heatmap, label, hum):
     img_224 = np.array(img_pil.resize((224, 224)))
     hsv = cv2.cvtColor(img_224, cv2.COLOR_RGB2HSV)
-    
-    # Vision Modality
     leaf_mask = cv2.inRange(hsv, (5, 20, 20), (95, 255, 255))
-    leaf_pixels = np.sum(leaf_mask > 0)
-    if (leaf_pixels / leaf_mask.size) < 0.10: return None 
+    leaf_px = np.sum(leaf_mask > 0)
+    
+    if (leaf_px / leaf_mask.size) < 0.10: return None
 
-    if label == "healthy":
-        return {"sev": 0, "level": "OPTIMAL", "health": 100, "cost": 150}
-
-    # Precision Spot Detection (Vision + Color)
-    color_mask = cv2.inRange(hsv, (10, 40, 20), (35, 255, 180)) 
-    ai_mask = (heatmap > 0.65).astype(np.uint8) * 255
+    # Vision Logic: Spot detection
+    color_mask = cv2.inRange(hsv, (10, 40, 20), (35, 255, 180))
+    ai_mask = (heatmap > 0.60).astype(np.uint8) * 255
     disease_mask = cv2.bitwise_and(color_mask, ai_mask)
-    
-    vision_sev = (np.sum(disease_mask > 0) / leaf_pixels) * 100
-    
-    # Sensor Modality (Weather Fusion)
-    # Scab/Rust risk multiplier based on Humidity
-    weather_multiplier = 1.4 if hum > 80 else 1.0
-    final_sev = min(100, vision_sev * weather_multiplier)
-    
-    # Categorization
-    if final_sev < 8: level = "LOW (Trace)"
-    elif final_sev < 30: level = "MEDIUM (Active)"
-    else: level = "HIGH (Critical Outbreak)"
-    
-    cost = STRATEGY_DB[label]['base_price'] * (0.3 if final_sev < 8 else 0.7 if final_sev < 30 else 1.0)
-    return {"sev": round(final_sev, 2), "level": level, "health": round(100-final_sev, 2), "cost": int(cost)}
+    vision_sev = (np.sum(disease_mask > 0) / leaf_px) * 100 if label != "healthy" else 0
 
-# --- 5. STREAMLIT INTERFACE ---
+    # Multi-Modal Logic: Weather Fusion
+    risk_index = vision_sev * (1.5 if hum > 80 else 1.0)
+    
+    if risk_index < 8: level = "Low"
+    elif risk_index < 30: level = "Medium"
+    else: level = "High"
+
+    return {"sev": round(risk_index, 2), "level": level, "advice": TREATMENT_PLAN[label][level]}
+
+# --- 4. STREAMLIT UI ---
 st.set_page_config(page_title="AppleAI Multi-Modal", layout="wide")
-st.title("🍎 Multi-Modal Orchard Intelligence")
+st.title("🍎 AppleAI: Multi-Modal Decision Intelligence")
 
-files = st.file_uploader("Batch Upload Leaf Images", accept_multiple_files=True)
+# Sidebar Sensors
+st.sidebar.header("📡 Live Field Sensors")
+hum = st.sidebar.slider("Ambient Humidity (%)", 30, 100, 75)
+temp = st.sidebar.slider("Temperature (°C)", 10, 45, 24)
+
+files = st.file_uploader("Upload Leaf Samples", accept_multiple_files=True)
 
 if files:
     m = models.mobilenet_v2(weights=None)
@@ -108,31 +110,33 @@ if files:
         with torch.set_grad_enabled(True):
             out = m(x)
             idx = torch.max(out, 1)[1].item()
-            label = CLASS_NAMES[idx]
+            label = ["black_rot", "healthy", "rust", "scab"][idx]
             heatmap = gcam.generate(x, idx)
 
-        res = analyze_multi_modal(img, heatmap, label, humidity, temperature)
-        if res is None: continue
+        res = run_analytics(img, heatmap, label, hum)
+        if not res: continue
 
-        summary.append({"File": f.name, "Diagnosis": label.title(), "Level": res['level'], "Severity": res['sev'], "Cost": res['cost']})
+        summary.append({"File": f.name, "Diagnosis": label.title(), "Level": res['level'], "Risk": res['sev']})
 
-        with st.expander(f"Analysis: {f.name} - {res['level']}"):
-            c1, c2, c3 = st.columns(3)
-            c1.image(img, use_container_width=True, caption="Sample")
+        with st.expander(f"REPORT: {f.name} - {res['level']} RISK"):
+            c1, c2 = st.columns([1, 2])
+            
+            # XAI Heatmap Visualization
             img_np = np.array(img.resize((224,224)))
             ht = cv2.applyColorMap(np.uint8(255*heatmap), cv2.COLORMAP_JET)
-            ov = cv2.addWeighted(img_np, 0.6, cv2.cvtColor(ht, cv2.COLOR_BGR2RGB), 0.4, 0)
-            c2.image(ov, use_container_width=True, caption="AI Heatmap (Sharp)")
-            c3.metric("Severity", f"{res['sev']}%")
-            c3.subheader(f"Level: {res['level']}")
-            c3.write(f"Treatment Cost: ₹{res['cost']}")
+            ov = cv2.addWeighted(img_np, 0.5, cv2.cvtColor(ht, cv2.COLOR_BGR2RGB), 0.5, 0)
+            c1.image(ov, caption="Explainable AI Map")
+            
+            # Detailed Prescription
+            c2.subheader(f"Diagnosis: {label.replace('_',' ').title()}")
+            c2.metric("Combined Risk Index", f"{res['sev']}%")
+            c2.info(res['advice'])
 
     if summary:
-        df = pd.DataFrame(summary)
         st.divider()
-        st.header("🚜 Orchard Dashboard (Multi-Modal)")
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Avg Severity", f"{df['Severity'].mean():.1f}%")
-        k2.metric("Total Treatment Cost", f"₹{df['Cost'].sum()}")
-        k3.metric("Critical Alerts", len(df[df['Level'].str.contains("HIGH")]))
-        st.plotly_chart(px.bar(df, x="File", y="Severity", color="Level", title="Field Severity Distribution"))
+        df = pd.DataFrame(summary)
+        st.subheader("📊 Orchard Disease Distribution")
+        fig = px.bar(df, x="File", y="Risk", color="Level", 
+                     color_discrete_map={"Low":"green", "Medium":"orange", "High":"red"},
+                     title="Spatial Severity Analysis")
+        st.plotly_chart(fig, use_container_width=True)
