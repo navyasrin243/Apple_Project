@@ -6,10 +6,8 @@ from PIL import Image
 import numpy as np
 import cv2
 import pandas as pd
-import plotly.express as px
 
 # --- 1. SMART TREATMENT & COST ENGINE ---
-# Database for Decision Intelligence
 DECISION_DB = {
     "scab": {"base_cost": 800, "med": "Mancozeb", "org": "Neem Oil"},
     "rust": {"base_cost": 1200, "med": "Myclobutanil", "org": "Sulfur Spray"},
@@ -17,18 +15,20 @@ DECISION_DB = {
     "healthy": {"base_cost": 200, "med": "N/A", "org": "Organic Nutrients"}
 }
 
-def get_smart_recommendation(label, severity):
+def get_smart_recommendation(label, severity, hum):
     db = DECISION_DB.get(label, DECISION_DB["healthy"])
+    # Multi-modal risk adjustment
+    risk_score = severity * (1.5 if hum > 80 else 1.0)
     
-    if severity < 5:
+    if risk_score < 5:
         level = "TRACE (Early Detection)"
         advice = f"🌱 **Early Stage:** No chemicals needed. Use {db['org']} and increase pruning for airflow."
         cost = db['base_cost'] * 0.2
-    elif severity < 20:
+    elif risk_score < 20:
         level = "LOW"
         advice = f"🌿 **Mild Infection:** Apply {db['org']} mixed with baking soda. Monitor weekly."
         cost = db['base_cost'] * 0.5
-    elif severity < 50:
+    elif risk_score < 50:
         level = "MEDIUM"
         advice = f"⚠️ **Moderate Damage:** Systematic application of {db['med']} (2g/L) required immediately."
         cost = db['base_cost'] * 0.8
@@ -37,9 +37,9 @@ def get_smart_recommendation(label, severity):
         advice = f"🚨 **Critical Outbreak:** Strong intervention with {db['med']} + destroy infected fallen leaves."
         cost = db['base_cost']
         
-    return level, advice, int(cost)
+    return level, advice, int(cost), round(risk_score, 2)
 
-# --- 2. XAI & PREDICTION SETUP ---
+# --- 2. XAI ENGINE (Grad-CAM) ---
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model, self.target_layer = model, target_layer
@@ -65,18 +65,25 @@ class GradCAM:
             h1.remove(); h2.remove()
 
 # --- 3. STREAMLIT UI ---
-st.set_page_config(page_title="AppleAI Precision", layout="wide")
+st.set_page_config(page_title="AppleAI Pro", layout="wide")
 st.title("🍎 Apple Orchard Decision Intelligence")
 
-files = st.file_uploader("Batch Upload Leaf Samples", accept_multiple_files=True)
+# Sidebar Sensors for Multi-Modal Data
+st.sidebar.header("📡 Field Sensors")
+hum = st.sidebar.slider("Ambient Humidity (%)", 30, 100, 75)
+temp = st.sidebar.slider("Temperature (°C)", 10, 45, 24)
+
+files = st.file_uploader("Upload Leaf Samples", accept_multiple_files=True, type=['jpg','png','jpeg'])
 
 if files:
-    # Model Init
     m = models.mobilenet_v2(weights=None); m.classifier[1] = nn.Linear(m.last_channel, 4)
-    m.load_state_dict(torch.load("model.pth", map_location="cpu")); m.eval()
+    try:
+        m.load_state_dict(torch.load("model.pth", map_location="cpu")); m.eval()
+    except:
+        st.error("Model file 'model.pth' not found in repository."); st.stop()
+        
     gcam = GradCAM(m, m.features[-1])
-    
-    all_results = []
+    batch_data = []
 
     for f in files:
         img = Image.open(f).convert("RGB")
@@ -89,43 +96,43 @@ if files:
             label = ["black_rot", "healthy", "rust", "scab"][idx.item()]
             conf_score = conf.item() * 100
 
-        # Severity Logic (Hybrid Vision + Color)
+        # Calculate Affected Percentage
         img_np = np.array(img.resize((224,224)))
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-        mask = cv2.inRange(hsv, (5, 30, 20), (35, 255, 180))
+        leaf_mask = cv2.inRange(hsv, (5, 20, 20), (95, 255, 255))
+        color_mask = cv2.inRange(hsv, (10, 40, 20), (35, 255, 180))
         ai_mask = (heatmap > 0.6).astype(np.uint8) * 255
-        sev = (np.sum(cv2.bitwise_and(mask, ai_mask) > 0) / np.sum(cv2.inRange(hsv, (5,20,20), (95,255,255)) > 0)) * 100
-        sev = sev if label != "healthy" else 0
+        disease_px = np.sum(cv2.bitwise_and(color_mask, ai_mask) > 0)
+        leaf_px = np.sum(leaf_mask > 0)
+        affected_pct = (disease_px / leaf_px * 100) if (label != "healthy" and leaf_px > 0) else 0
         
-        # Smart Logic
-        level, advice, cost = get_smart_recommendation(label, sev)
-        health_score = 100 - sev
+        level, advice, cost, risk_idx = get_smart_recommendation(label, affected_pct, hum)
+        batch_data.append({"File": f.name, "Diagnosis": label.title(), "Affected %": affected_pct, "Level": level})
 
-        all_results.append({
-            "File": f.name, "Diagnosis": label.title(), "Confidence": conf_score,
-            "Severity": sev, "Health": health_score, "Level": level, "Cost": cost, "Advice": advice
-        })
-
-        with st.expander(f"Analysis: {f.name}"):
-            c1, c2, c3 = st.columns(3)
-            # Explainable AI Overlay
-            ht = cv2.applyColorMap(np.uint8(255*heatmap), cv2.COLORMAP_JET)
-            ov = cv2.addWeighted(img_np, 0.5, cv2.cvtColor(ht, cv2.COLOR_BGR2RGB), 0.5, 0)
-            c1.image(ov, caption="Explainable AI Map")
-            c2.metric("Health Score", f"{health_score:.1f}%")
-            c2.metric("AI Confidence", f"{conf_score:.1f}%")
-            c3.subheader(f"Level: {level}")
-            c3.info(advice)
-            c3.write(f"**Sample Treatment Cost:** ₹{cost}")
-
-    # --- FIELD ANALYTICS (Multi-Image Tracking) ---
-    if all_results:
-        df = pd.DataFrame(all_results)
+        # --- CLEAN DIAGNOSTIC REPORT DISPLAY ---
         st.divider()
-        st.header("🚜 Orchard Field Analytics (Multi-Modal)")
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Field Health Score", f"{df['Health'].mean():.1f}%")
-        k2.metric("Est. Cost / Acre", f"₹{int(df['Cost'].mean() * 3.5)}") # Acre multiplier
-        k3.metric("Critical Samples", len(df[df['Severity'] > 40]))
+        st.subheader(f"📋 Diagnostic Report: {f.name}")
         
-        st.plotly_chart(px.bar(df, x="File", y="Severity", color="Diagnosis", title="Field Disease Distribution"))
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Classification", label.upper())
+        m2.metric("Affected Area", f"{affected_pct:.1f}%", delta=f"{level} Risk", delta_color="inverse")
+        m3.metric("AI Confidence", f"{conf_score:.1f}%")
+
+        c_left, c_right = st.columns(2)
+        
+        # Heatmap
+        ht = cv2.applyColorMap(np.uint8(255*heatmap), cv2.COLORMAP_JET)
+        ov = cv2.addWeighted(img_np, 0.5, cv2.cvtColor(ht, cv2.COLOR_BGR2RGB), 0.5, 0)
+        c_left.image(ov, use_container_width=True, caption="Explainable AI: Affected Spots Highlighted")
+        
+        # Prescription
+        c_right.info(f"**Smart Treatment Plan:**\n\n{advice}")
+        c_right.success(f"**Health Score:** {100 - affected_pct:.1f}%")
+        c_right.warning(f"**Est. Treatment Cost:** ₹{cost}")
+
+    # --- BATCH SUMMARY ---
+    if len(batch_data) > 1:
+        st.divider()
+        st.header("🚜 Orchard Batch Summary")
+        df = pd.DataFrame(batch_data)
+        st.table(df)
