@@ -17,27 +17,25 @@ DECISION_DB = {
 
 def get_smart_recommendation(label, severity, hum):
     db = DECISION_DB.get(label, DECISION_DB["healthy"])
+    # Risk increases with humidity
     risk_score = severity * (1.5 if hum > 80 else 1.0)
     
-    if label == "healthy" or risk_score < 0.4:
+    if label == "healthy" or risk_score < 0.1:
         return "OPTIMAL", "✅ Leaf appears healthy. Maintain routine organic nutrients.", 200, 0.0
 
-    if risk_score < 8:
-        level, cost = "TRACE (Early Detection)", db['base_cost'] * 0.2
-        advice = f"🌱 **Early Stage:** No chemicals. Use {db['org']} and prune for airflow."
-    elif risk_score < 25:
-        level, cost = "LOW", db['base_cost'] * 0.5
-        advice = f"🌿 **Mild Infection:** Apply {db['org']} mixed with baking soda."
-    elif risk_score < 50:
-        level, cost = "MEDIUM", db['base_cost'] * 0.8
-        advice = f"⚠️ **Moderate Damage:** Systematic application of {db['med']} (2g/L)."
+    if risk_score < 10:
+        level, cost = "LOW", db['base_cost'] * 0.4
+        advice = f"🌿 **Mild:** Apply {db['org']} and monitor."
+    elif risk_score < 40:
+        level, cost = "MEDIUM", db['base_cost'] * 0.7
+        advice = f"⚠️ **Moderate:** Systematic {db['med']} application."
     else:
         level, cost = "HIGH", db['base_cost']
-        advice = f"🚨 **Critical Outbreak:** Strong {db['med']} + destroy infected leaves."
+        advice = f"🚨 **Critical:** Strong {db['med']} + prune infected area."
         
     return level, advice, int(cost), round(risk_score, 2)
 
-# --- 2. XAI ENGINE (Grad-CAM) ---
+# --- 2. XAI ENGINE ---
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model, self.target_layer = model, target_layer
@@ -56,26 +54,23 @@ class GradCAM:
             cam = np.zeros(acts.shape[1:], dtype=np.float32)
             for i, w in enumerate(weights): cam += w * acts[i, :, :]
             cam = np.maximum(cam, 0)
-            cam = np.power(cam, 2) 
             cam = cv2.resize(cam, (224, 224))
             return (cam - cam.min()) / (cam.max() - cam.min() + 1e-8), torch.softmax(logits, dim=1)
         finally:
             h1.remove(); h2.remove()
 
-# --- 3. UI & PROCESSING ---
-st.set_page_config(page_title="AppleAI Pro", layout="wide")
-st.title("🍎 AppleAI: Precision Diagnostic System")
+# --- 3. UI ---
+st.set_page_config(page_title="AppleAI Final", layout="wide")
+st.title("🍎 AppleAI Precision Diagnostic")
 
-st.sidebar.header("📡 Field Sensors")
-hum = st.sidebar.slider("Ambient Humidity (%)", 30, 100, 75)
-
-files = st.file_uploader("Upload Leaf Samples", accept_multiple_files=True)
+hum = st.sidebar.slider("Humidity (%)", 30, 100, 75)
+files = st.file_uploader("Upload Leaves", accept_multiple_files=True)
 
 if files:
     m = models.mobilenet_v2(weights=None); m.classifier[1] = nn.Linear(m.last_channel, 4)
     m.load_state_dict(torch.load("model.pth", map_location="cpu")); m.eval()
     gcam = GradCAM(m, m.features[-1])
-    batch_summary = []
+    summary = []
 
     for f in files:
         img = Image.open(f).convert("RGB")
@@ -88,61 +83,36 @@ if files:
             label = ["black_rot", "healthy", "rust", "scab"][idx.item()]
             conf_score = conf.item() * 100
 
-        # --- SEVERITY CALCULATIONS ---
+        # --- STABLE SEVERITY LOGIC ---
         img_np = np.array(img.resize((224,224)))
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
         leaf_mask = cv2.inRange(hsv, (5, 20, 20), (95, 255, 255))
         
-        # 🧪 SPECIFIC RUST COLOR SENSITIVITY
-        if label == "rust":
-            # Targeted orange/yellow range for rust lesions
-            color_mask = cv2.inRange(hsv, (5, 60, 60), (45, 255, 255))
-        else:
-            # Standard dark/brown/black range for Scab and Rot
-            color_mask = cv2.inRange(hsv, (10, 40, 20), (35, 255, 180))
-            
-        ai_mask = (heatmap > 0.60).astype(np.uint8) * 255
-        disease_px = np.sum(cv2.bitwise_and(color_mask, ai_mask) > 0)
-        leaf_px = np.sum(leaf_mask > 0)
-        affected_pct = (disease_px / leaf_px * 100) if (leaf_px > 0) else 0
-
-        # --- SMART BALANCED FILTER (V3) ---
-        if label == "scab":
-            # Scab Filter (Keep previous high threshold for bark noise)
-            if affected_pct < 1.2 and conf_score < 92.0:
-                label = "healthy"
-                affected_pct = 0.0
-        elif label == "rust":
-            # Rust Filter (More sensitive - don't filter if confidence is good)
-            if affected_pct < 0.3 and conf_score < 75.0:
-                label = "healthy"
-                affected_pct = 0.0
-        elif label == "black_rot":
-            if affected_pct < 0.5 and conf_score < 80.0:
-                label = "healthy"
+        # Simple detection: AI High-Activation Areas
+        ai_mask = (heatmap > 0.5).astype(np.uint8) * 255
+        affected_pct = (np.sum(ai_mask > 0) / np.sum(leaf_mask > 0) * 100) if label != "healthy" else 0
+        
+        # --- STABLE OVERRIDE ---
+        # If AI confidence is low, ignore the disease label and call it Healthy
+        if conf_score < 80.0:
+            label = "healthy"
+            affected_pct = 0.0
 
         level, advice, cost, risk_idx = get_smart_recommendation(label, affected_pct, hum)
-        batch_summary.append({
-            "File": f.name, "Diagnosis": label.upper(), "Confidence": f"{conf_score:.1f}%",
-            "Affected Area": f"{affected_pct:.1f}%", "Risk Level": level, "Cost": f"₹{cost}"
-        })
+        summary.append({"File": f.name, "Result": label.upper(), "Confidence": f"{conf_score:.1f}%", "Affected": f"{affected_pct:.1f}%", "Cost": f"₹{cost}"})
 
-        st.divider()
-        st.subheader(f"📋 Diagnostic Report: {f.name}")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Classification", label.upper())
-        m2.metric("Affected Area", f"{affected_pct:.1f}%", delta=level, delta_color="inverse")
-        m3.metric("AI Confidence", f"{conf_score:.1f}%")
-
+        st.subheader(f"Report: {f.name}")
         c1, c2 = st.columns(2)
+        
         ht = cv2.applyColorMap(np.uint8(255*heatmap), cv2.COLORMAP_JET)
         ov = cv2.addWeighted(img_np, 0.5, cv2.cvtColor(ht, cv2.COLOR_BGR2RGB), 0.5, 0)
-        c1.image(ov, use_container_width=True, caption="Explainable AI Map")
-        c2.info(f"**Prescription:** {advice}")
-        c2.success(f"**Health Score:** {100 - affected_pct:.1f}%")
-        c2.warning(f"**Treatment Cost:** ₹{cost}")
+        c1.image(ov, caption="AI Detection Area")
+        
+        c2.metric("Diagnosis", label.upper())
+        c2.metric("Affected Area", f"{affected_pct:.1f}%")
+        c2.info(advice)
 
-    if batch_summary:
+    if summary:
         st.divider()
-        st.header("📊 Batch Analysis Summary Table")
-        st.table(pd.DataFrame(batch_summary))
+        st.subheader("📊 Batch Summary")
+        st.table(pd.DataFrame(summary))
