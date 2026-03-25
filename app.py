@@ -8,99 +8,75 @@ import cv2
 import pandas as pd
 import plotly.express as px
 
-# --- 1. RESEARCH-GRADE TREATMENT DATABASE ---
-TREATMENT_PLAN = {
-    "scab": {
-        "Low": "🌿 **Organic Detection:** Spray 1% Potassium Bicarbonate. Prune shaded inner branches to improve airflow.",
-        "Medium": "⚠️ **Standard Treatment:** Apply Mancozeb (2g/L). Repeat after 14 days if humidity remains >70%.",
-        "High": "🚨 **Emergency Action:** Use Myclobutanil (40WP) immediately. Burn heavily infected fallen leaves to stop spore cycle."
-    },
-    "rust": {
-        "Low": "🌿 **Organic Detection:** Apply Neem Oil (5ml/L) at sunset. Monitor nearby Cedar trees (alternate host).",
-        "Medium": "⚠️ **Standard Treatment:** Propiconazole (1ml/L). Ensure 100% coverage of both leaf surfaces.",
-        "High": "🚨 **Emergency Action:** Systemic Fungicide (Tilt 250 EC). Apply at 10-day intervals until new growth is clear."
-    },
-    "black_rot": {
-        "Low": "🌿 **Organic Detection:** Copper-based soap spray. Remove any 'mummy' fruits left from last season.",
-        "Medium": "⚠️ **Standard Treatment:** Captan 50 WP (2.5g/L). Focus application on the lower fruit clusters.",
-        "High": "🚨 **Emergency Action:** Flutriafol application. Aggressively prune and destroy infected wood cankers."
-    },
-    "healthy": {
-        "Low": "✅ **Optimal:** Maintain current mulch. Balanced NPK (10-10-10) application recommended.",
-        "Medium": "✅ **Optimal:** Add Calcium-Boron foliar spray to strengthen leaf cell walls against future fungi.",
-        "High": "✅ **Optimal:** Field health is excellent. Ensure irrigation does not wet the foliage directly."
-    }
+# --- 1. SMART TREATMENT & COST ENGINE ---
+# Database for Decision Intelligence
+DECISION_DB = {
+    "scab": {"base_cost": 800, "med": "Mancozeb", "org": "Neem Oil"},
+    "rust": {"base_cost": 1200, "med": "Myclobutanil", "org": "Sulfur Spray"},
+    "black_rot": {"base_cost": 950, "med": "Captan", "org": "Copper Soap"},
+    "healthy": {"base_cost": 200, "med": "N/A", "org": "Organic Nutrients"}
 }
 
-# --- 2. XAI ENGINE (Sharpened Grad-CAM) ---
+def get_smart_recommendation(label, severity):
+    db = DECISION_DB.get(label, DECISION_DB["healthy"])
+    
+    if severity < 5:
+        level = "TRACE (Early Detection)"
+        advice = f"🌱 **Early Stage:** No chemicals needed. Use {db['org']} and increase pruning for airflow."
+        cost = db['base_cost'] * 0.2
+    elif severity < 20:
+        level = "LOW"
+        advice = f"🌿 **Mild Infection:** Apply {db['org']} mixed with baking soda. Monitor weekly."
+        cost = db['base_cost'] * 0.5
+    elif severity < 50:
+        level = "MEDIUM"
+        advice = f"⚠️ **Moderate Damage:** Systematic application of {db['med']} (2g/L) required immediately."
+        cost = db['base_cost'] * 0.8
+    else:
+        level = "HIGH"
+        advice = f"🚨 **Critical Outbreak:** Strong intervention with {db['med']} + destroy infected fallen leaves."
+        cost = db['base_cost']
+        
+    return level, advice, int(cost)
+
+# --- 2. XAI & PREDICTION SETUP ---
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model, self.target_layer = model, target_layer
         self.gradients, self.activations = None, None
-
     def save_grad(self, m, gi, go): self.gradients = go[0]
     def save_act(self, m, i, o): self.activations = o
-
     def generate(self, x, idx):
         h1 = self.target_layer.register_forward_hook(self.save_act)
         h2 = self.target_layer.register_full_backward_hook(self.save_grad)
         try:
             self.model.zero_grad()
-            self.model(x)[0, idx].backward()
+            logits = self.model(x)
+            logits[0, idx].backward()
             grads, acts = self.gradients.cpu().data.numpy()[0], self.activations.cpu().data.numpy()[0]
             weights = np.mean(grads, axis=(1, 2))
             cam = np.zeros(acts.shape[1:], dtype=np.float32)
             for i, w in enumerate(weights): cam += w * acts[i, :, :]
             cam = np.maximum(cam, 0)
-            cam = np.power(cam, 2) # Sharpening spots
+            cam = np.power(cam, 2)
             cam = cv2.resize(cam, (224, 224))
-            denom = cam.max() - cam.min()
-            return (cam - cam.min()) / (denom if denom != 0 else 1e-8)
+            return (cam - cam.min()) / (cam.max() - cam.min() + 1e-8), torch.softmax(logits, dim=1)
         finally:
             h1.remove(); h2.remove()
 
-# --- 3. MULTI-MODAL ANALYTICS ---
-def run_analytics(img_pil, heatmap, label, hum):
-    img_224 = np.array(img_pil.resize((224, 224)))
-    hsv = cv2.cvtColor(img_224, cv2.COLOR_RGB2HSV)
-    leaf_mask = cv2.inRange(hsv, (5, 20, 20), (95, 255, 255))
-    leaf_px = np.sum(leaf_mask > 0)
-    
-    if (leaf_px / leaf_mask.size) < 0.10: return None
+# --- 3. STREAMLIT UI ---
+st.set_page_config(page_title="AppleAI Precision", layout="wide")
+st.title("🍎 Apple Orchard Decision Intelligence")
 
-    # Vision Logic: Spot detection
-    color_mask = cv2.inRange(hsv, (10, 40, 20), (35, 255, 180))
-    ai_mask = (heatmap > 0.60).astype(np.uint8) * 255
-    disease_mask = cv2.bitwise_and(color_mask, ai_mask)
-    vision_sev = (np.sum(disease_mask > 0) / leaf_px) * 100 if label != "healthy" else 0
-
-    # Multi-Modal Logic: Weather Fusion
-    risk_index = vision_sev * (1.5 if hum > 80 else 1.0)
-    
-    if risk_index < 8: level = "Low"
-    elif risk_index < 30: level = "Medium"
-    else: level = "High"
-
-    return {"sev": round(risk_index, 2), "level": level, "advice": TREATMENT_PLAN[label][level]}
-
-# --- 4. STREAMLIT UI ---
-st.set_page_config(page_title="AppleAI Multi-Modal", layout="wide")
-st.title("🍎 AppleAI: Multi-Modal Decision Intelligence")
-
-# Sidebar Sensors
-st.sidebar.header("📡 Live Field Sensors")
-hum = st.sidebar.slider("Ambient Humidity (%)", 30, 100, 75)
-temp = st.sidebar.slider("Temperature (°C)", 10, 45, 24)
-
-files = st.file_uploader("Upload Leaf Samples", accept_multiple_files=True)
+files = st.file_uploader("Batch Upload Leaf Samples", accept_multiple_files=True)
 
 if files:
-    m = models.mobilenet_v2(weights=None)
-    m.classifier[1] = nn.Linear(m.last_channel, 4)
-    m.load_state_dict(torch.load("model.pth", map_location="cpu"))
-    m.eval()
+    # Model Init
+    m = models.mobilenet_v2(weights=None); m.classifier[1] = nn.Linear(m.last_channel, 4)
+    m.load_state_dict(torch.load("model.pth", map_location="cpu")); m.eval()
     gcam = GradCAM(m, m.features[-1])
-    summary = []
+    
+    all_results = []
 
     for f in files:
         img = Image.open(f).convert("RGB")
@@ -108,35 +84,48 @@ if files:
         x = tf(img).unsqueeze(0)
         
         with torch.set_grad_enabled(True):
-            out = m(x)
-            idx = torch.max(out, 1)[1].item()
-            label = ["black_rot", "healthy", "rust", "scab"][idx]
-            heatmap = gcam.generate(x, idx)
+            heatmap, probs = gcam.generate(x, torch.max(m(x), 1)[1].item())
+            conf, idx = torch.max(probs, 1)
+            label = ["black_rot", "healthy", "rust", "scab"][idx.item()]
+            conf_score = conf.item() * 100
 
-        res = run_analytics(img, heatmap, label, hum)
-        if not res: continue
+        # Severity Logic (Hybrid Vision + Color)
+        img_np = np.array(img.resize((224,224)))
+        hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+        mask = cv2.inRange(hsv, (5, 30, 20), (35, 255, 180))
+        ai_mask = (heatmap > 0.6).astype(np.uint8) * 255
+        sev = (np.sum(cv2.bitwise_and(mask, ai_mask) > 0) / np.sum(cv2.inRange(hsv, (5,20,20), (95,255,255)) > 0)) * 100
+        sev = sev if label != "healthy" else 0
+        
+        # Smart Logic
+        level, advice, cost = get_smart_recommendation(label, sev)
+        health_score = 100 - sev
 
-        summary.append({"File": f.name, "Diagnosis": label.title(), "Level": res['level'], "Risk": res['sev']})
+        all_results.append({
+            "File": f.name, "Diagnosis": label.title(), "Confidence": conf_score,
+            "Severity": sev, "Health": health_score, "Level": level, "Cost": cost, "Advice": advice
+        })
 
-        with st.expander(f"REPORT: {f.name} - {res['level']} RISK"):
-            c1, c2 = st.columns([1, 2])
-            
-            # XAI Heatmap Visualization
-            img_np = np.array(img.resize((224,224)))
+        with st.expander(f"Analysis: {f.name}"):
+            c1, c2, c3 = st.columns(3)
+            # Explainable AI Overlay
             ht = cv2.applyColorMap(np.uint8(255*heatmap), cv2.COLORMAP_JET)
             ov = cv2.addWeighted(img_np, 0.5, cv2.cvtColor(ht, cv2.COLOR_BGR2RGB), 0.5, 0)
             c1.image(ov, caption="Explainable AI Map")
-            
-            # Detailed Prescription
-            c2.subheader(f"Diagnosis: {label.replace('_',' ').title()}")
-            c2.metric("Combined Risk Index", f"{res['sev']}%")
-            c2.info(res['advice'])
+            c2.metric("Health Score", f"{health_score:.1f}%")
+            c2.metric("AI Confidence", f"{conf_score:.1f}%")
+            c3.subheader(f"Level: {level}")
+            c3.info(advice)
+            c3.write(f"**Sample Treatment Cost:** ₹{cost}")
 
-    if summary:
+    # --- FIELD ANALYTICS (Multi-Image Tracking) ---
+    if all_results:
+        df = pd.DataFrame(all_results)
         st.divider()
-        df = pd.DataFrame(summary)
-        st.subheader("📊 Orchard Disease Distribution")
-        fig = px.bar(df, x="File", y="Risk", color="Level", 
-                     color_discrete_map={"Low":"green", "Medium":"orange", "High":"red"},
-                     title="Spatial Severity Analysis")
-        st.plotly_chart(fig, use_container_width=True)
+        st.header("🚜 Orchard Field Analytics (Multi-Modal)")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Field Health Score", f"{df['Health'].mean():.1f}%")
+        k2.metric("Est. Cost / Acre", f"₹{int(df['Cost'].mean() * 3.5)}") # Acre multiplier
+        k3.metric("Critical Samples", len(df[df['Severity'] > 40]))
+        
+        st.plotly_chart(px.bar(df, x="File", y="Severity", color="Diagnosis", title="Field Disease Distribution"))
