@@ -19,12 +19,12 @@ class AppleDiagnostics:
         self.target_layer.register_forward_hook(lambda m, i, o: setattr(self, 'activations', o))
         self.target_layer.register_full_backward_hook(lambda m, gi, go: setattr(self, 'gradients', go[0]))
 
-    def analyze(self, img_pil, label_idx):
+   def analyze(self, img_pil, label_idx):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # ZOOM: Crop center 85% to make tiny rust spots look larger to the AI
+        # 1. Preprocessing with tighter crop to remove background
         w, h = img_pil.size
-        img_cropped = img_pil.crop((w*0.07, h*0.07, w*0.93, h*0.93))
+        img_cropped = img_pil.crop((w*0.1, h*0.1, w*0.9, h*0.9))
         
         tf = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -33,22 +33,37 @@ class AppleDiagnostics:
         ])
         input_t = tf(img_cropped).unsqueeze(0).to(device)
         
+        # 2. Generate Grad-CAM
         self.model.zero_grad()
         output = self.model(input_t)
         output[0, label_idx].backward()
         
-        # Grad-CAM Logic
         grads = self.gradients.detach().cpu().numpy().squeeze()
         acts = self.activations.detach().cpu().numpy().squeeze()
         weights = np.mean(grads, axis=(1, 2))
-        cam = np.zeros(acts.shape[1:], dtype=np.float32)
-        for i, w in enumerate(weights): cam += w * acts[i, :, :]
         
+        cam = np.zeros(acts.shape[1:], dtype=np.float32)
+        for i, w in enumerate(weights):
+            cam += w * acts[i, :, :]
+            
         cam = np.maximum(cam, 0)
         heatmap = cv2.resize(cam, (224, 224))
-        if heatmap.max() > 0: heatmap /= (heatmap.max() + 1e-8)
 
-        # Severity via HSV masking
+        # --- NEW: SPATIAL NOISE SUPPRESSION ---
+        # This creates a 'tunnel vision' mask that ignores the edges/corners 
+        # where your current heatmaps are wrongly sticking (as seen in your screenshot)
+        Y, X = np.ogrid[:224, :224]
+        center_mask = np.exp(-((X - 112)**2 + (Y - 112)**2) / (2 * 80**2))
+        heatmap = heatmap * center_mask
+
+        # --- NEW: SPOT ENHANCEMENT ---
+        # Highlights only the highest intensity peaks (the actual rust spots)
+        heatmap[heatmap < 0.3 * heatmap.max()] = 0 
+        
+        if heatmap.max() > 0:
+            heatmap /= (heatmap.max() + 1e-8)
+
+        # 3. Diagnostic Metrics
         img_np = np.array(img_cropped.resize((224, 224)))
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
         leaf_mask = cv2.inRange(hsv, (5, 30, 30), (90, 255, 255))
@@ -59,7 +74,6 @@ class AppleDiagnostics:
         severity = (disease_px / leaf_px * 100) if leaf_px > 0 else 0
         
         return heatmap, round(min(severity, 100.0), 2), img_cropped
-
 # --- 2. MODEL LOADING ---
 @st.cache_resource
 def load_all():
