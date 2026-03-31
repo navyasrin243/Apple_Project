@@ -44,7 +44,7 @@ class AppleDiagnostics:
 
 # --- 2. APP UI ---
 st.set_page_config(page_title="AppleAI Pro", layout="wide")
-st.title("🍎 AppleAI Precision Diagnostic")
+st.title("🍎 AppleAI: Precision Field Diagnostic")
 
 @st.cache_resource
 def load_all():
@@ -52,7 +52,6 @@ def load_all():
     model = models.mobilenet_v2(weights=None)
     model.classifier[1] = nn.Linear(model.last_channel, 4)
     
-    # Check multiple possible paths for the model file
     paths = ["model.pth", "/content/model.pth"]
     model_path = next((p for p in paths if os.path.exists(p)), None)
     
@@ -66,14 +65,50 @@ def load_all():
 model, engine, device = load_all()
 
 if model is None:
-    st.error("🚨 Critical Error: 'model.pth' not detected in directory.")
-    st.info("Please ensure you have run the training cell or uploaded the weight file.")
+    st.error("🚨 model.pth not found!")
 else:
     CLASS_NAMES = ['black_rot', 'healthy', 'rust', 'scab']
-    uploaded_file = st.file_uploader("Upload Leaf Photo", type=["jpg", "png", "jpeg"])
+    TREAT_DATA = {
+        "scab": {"med": "Captan 80 WDG", "price": 450},
+        "rust": {"med": "Myclobutanil", "price": 600},
+        "black_rot": {"med": "Mancozeb", "price": 550},
+        "healthy": {"med": "None", "price": 0}
+    }
+
+    uploaded_file = st.file_uploader("Upload Leaf Photo to Start Analysis", type=["jpg", "png", "jpeg"])
     
     if uploaded_file:
         img = Image.open(uploaded_file).convert("RGB")
-        # Diagnostic process...
-        # [Rest of the display logic from previous blocks]
-        st.success("Model loaded and ready for analysis!")
+        
+        # 1. Prediction
+        tf_inf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+        input_inf = tf_inf(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            out = model(input_inf)
+            idx = torch.max(out, 1)[1].item()
+            label = CLASS_NAMES[idx]
+        
+        # 2. Diagnostic Analysis
+        heatmap, severity = engine.analyze(img, idx)
+        
+        # 3. Final Display
+        st.success(f"Analysis Complete: **{label.upper()}** Detected")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.image(img, caption="Original Image", use_container_width=True)
+            st.metric("Infection Severity", f"{severity}%")
+            
+        with col2:
+            img_np = np.array(img.resize((224, 224)))
+            heatmap_c = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+            overlay = cv2.addWeighted(img_np, 0.6, cv2.cvtColor(heatmap_c, cv2.COLOR_BGR2RGB), 0.4, 0)
+            st.image(overlay, caption="Infection Hotspots (Grad-CAM)", use_container_width=True)
+            
+            if label != "healthy":
+                cost = int(TREAT_DATA[label]["price"] * (severity / 100))
+                st.warning(f"**Treatment:** {TREAT_DATA[label]['med']}")
+                st.info(f"**Precision Cost Estimate:** ₹{max(cost, 50)}")
+            else:
+                st.balloons()
+                st.write("Crop is in optimal health!")
