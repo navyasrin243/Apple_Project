@@ -19,7 +19,7 @@ class AppleDiagnostics:
         self.target_layer.register_forward_hook(lambda m, i, o: setattr(self, 'activations', o))
         self.target_layer.register_full_backward_hook(lambda m, gi, go: setattr(self, 'gradients', go[0]))
 
-   def analyze(self, img_pil, label_idx):
+      def analyze(self, img_pil, label_idx):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 1. Preprocessing with tighter crop to remove background
