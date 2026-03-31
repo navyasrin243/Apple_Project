@@ -30,10 +30,24 @@ class AppleDiagnostics:
         output = self.model(input_t)
         output[0, label_idx].backward()
         
-        weights = np.mean(self.gradients.cpu().data.numpy()[0], axis=(1, 2))
-        cam = np.maximum(np.dot(weights, self.activations.cpu().data.numpy()[0]), 0)
+        # --- FIXED LOGIC START ---
+        # Get gradients and activations
+        grads = self.gradients.cpu().data.numpy()[0]
+        acts = self.activations.cpu().data.numpy()[0]
+        
+        # Pool the gradients (Global Average Pooling) to get weights per channel
+        weights = np.mean(grads, axis=(1, 2))
+        
+        # Create Weighted Combination of Maps
+        cam = np.zeros(acts.shape[1:], dtype=np.float32)
+        for i, w in enumerate(weights):
+            cam += w * acts[i, :, :]
+            
+        # ReLU and Normalization
+        cam = np.maximum(cam, 0)
         heatmap = cv2.resize(cam, (224, 224))
         heatmap /= (heatmap.max() + 1e-8)
+        # --- FIXED LOGIC END ---
 
         img_np = np.array(img_pil.resize((224, 224)))
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
