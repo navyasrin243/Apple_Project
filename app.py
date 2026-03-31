@@ -1,4 +1,4 @@
-
+%%writefile app.py
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -8,13 +8,14 @@ from PIL import Image
 from torchvision import models, transforms
 import os
 
-# --- 1. THE DIAGNOSTIC ENGINE ---
+# --- 1. THE DIAGNOSTIC ENGINE (Fixed for Dimension Mismatch) ---
 class AppleDiagnostics:
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
         self.gradients = None
         self.activations = None
+        # Hook to capture internal features and gradients
         self.target_layer.register_forward_hook(lambda m, i, o: setattr(self, 'activations', o))
         self.target_layer.register_full_backward_hook(lambda m, gi, go: setattr(self, 'gradients', go[0]))
 
@@ -30,34 +31,34 @@ class AppleDiagnostics:
         output = self.model(input_t)
         output[0, label_idx].backward()
         
-        # --- ROBUST DIMENSION HANDLING ---
-        # Ensure we have (C, H, W) by removing the batch dimension if present
+        # Pull data to CPU and remove batch dimension
         grads = self.gradients.detach().cpu().numpy().squeeze()
         acts = self.activations.detach().cpu().numpy().squeeze()
 
-        # Calculate Global Average Pooled gradients (Importance Weights)
-        # We average across the Spatial dimensions (H, W) which are indices 1 and 2
+        # Global Average Pooling of Gradients (Weights)
+        # MobileNetV2 has 1280 channels at the final feature layer
         weights = np.mean(grads, axis=(1, 2))
         
-        # Create Heatmap: Weighted sum of all 1280 activation maps
+        # Generate Weighted Heatmap
         cam = np.zeros(acts.shape[1:], dtype=np.float32)
         for i, w in enumerate(weights):
             cam += w * acts[i, :, :]
             
-        # ReLU Activation: Only keep features that contribute POSITIVELY to the class
+        # ReLU: Keep only positive features
         cam = np.maximum(cam, 0)
         
-        # Normalize for visualization
+        # Rescale and Normalize
         heatmap = cv2.resize(cam, (224, 224))
         if heatmap.max() > 0:
-            heatmap /= heatmap.max()
-        # ----------------------------------
+            heatmap /= (heatmap.max() + 1e-8)
 
+        # Calculate Severity via Masking
         img_np = np.array(img_pil.resize((224, 224)))
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-        # Masking the leaf (Green/Yellow range) to calculate severity
+        # Detect the leaf area (green/yellow spectrum)
         leaf_mask = cv2.inRange(hsv, (5, 30, 30), (90, 255, 255))
-        disease_mask = (heatmap > 0.4).astype(np.uint8) * 255 # 0.4 is a more sensitive threshold
+        # Detect the disease area from the heatmap hotspots
+        disease_mask = (heatmap > 0.4).astype(np.uint8) * 255
         
         leaf_area = np.sum(leaf_mask > 0)
         disease_area = np.sum(np.bitwise_and(disease_mask > 0, leaf_mask > 0))
@@ -65,16 +66,18 @@ class AppleDiagnostics:
         severity = (disease_area / leaf_area * 100) if leaf_area > 0 else 0
         return heatmap, round(min(severity, 100.0), 2)
 
-# --- 2. APP UI ---
+# --- 2. STREAMLIT UI ---
 st.set_page_config(page_title="AppleAI Pro", layout="wide")
-st.title("🍎 AppleAI: Precision Field Diagnostic")
+st.title("🍎 AppleAI: Precision Pathologist")
 
 @st.cache_resource
 def load_all():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Initialize MobileNetV2 architecture
     model = models.mobilenet_v2(weights=None)
     model.classifier[1] = nn.Linear(model.last_channel, 4)
     
+    # Locate model.pth in standard or Colab paths
     paths = ["model.pth", "/content/model.pth"]
     model_path = next((p for p in paths if os.path.exists(p)), None)
     
@@ -88,50 +91,52 @@ def load_all():
 model, engine, device = load_all()
 
 if model is None:
-    st.error("🚨 model.pth not found!")
+    st.error("🚨 'model.pth' not found. Please run the training cell or upload the file.")
 else:
     CLASS_NAMES = ['black_rot', 'healthy', 'rust', 'scab']
-    TREAT_DATA = {
+    TREATMENT = {
         "scab": {"med": "Captan 80 WDG", "price": 450},
         "rust": {"med": "Myclobutanil", "price": 600},
         "black_rot": {"med": "Mancozeb", "price": 550},
         "healthy": {"med": "None", "price": 0}
     }
 
-    uploaded_file = st.file_uploader("Upload Leaf Photo to Start Analysis", type=["jpg", "png", "jpeg"])
+    uploaded_file = st.file_uploader("Upload Leaf Photo", type=["jpg", "png", "jpeg"])
     
     if uploaded_file:
         img = Image.open(uploaded_file).convert("RGB")
         
-        # 1. Prediction
+        # 1. Classify
         tf_inf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
         input_inf = tf_inf(img).unsqueeze(0).to(device)
         with torch.no_grad():
             out = model(input_inf)
             idx = torch.max(out, 1)[1].item()
             label = CLASS_NAMES[idx]
-        
-        # 2. Diagnostic Analysis
+            conf = torch.softmax(out, 1)[0, idx].item()
+
+        # 2. Analyze (Diagnosis)
         heatmap, severity = engine.analyze(img, idx)
         
-        # 3. Final Display
-        st.success(f"Analysis Complete: **{label.upper()}** Detected")
+        # 3. Display Results
+        st.subheader(f"Detection Result: {label.upper()} ({conf*100:.1f}%)")
         
         col1, col2 = st.columns(2)
         with col1:
-            st.image(img, caption="Original Image", use_container_width=True)
+            st.image(img, caption="Original Input", use_container_width=True)
             st.metric("Infection Severity", f"{severity}%")
             
         with col2:
+            # Create Heatmap Overlay
             img_np = np.array(img.resize((224, 224)))
             heatmap_c = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
             overlay = cv2.addWeighted(img_np, 0.6, cv2.cvtColor(heatmap_c, cv2.COLOR_BGR2RGB), 0.4, 0)
-            st.image(overlay, caption="Infection Hotspots (Grad-CAM)", use_container_width=True)
+            st.image(overlay, caption="Disease Hotspots (Grad-CAM)", use_container_width=True)
             
             if label != "healthy":
-                cost = int(TREAT_DATA[label]["price"] * (severity / 100))
-                st.warning(f"**Treatment:** {TREAT_DATA[label]['med']}")
-                st.info(f"**Precision Cost Estimate:** ₹{max(cost, 50)}")
+                est_cost = int(TREATMENT[label]["price"] * (severity / 100))
+                st.warning(f"**Treatment Recommendation:** {TREATMENT[label]['med']}")
+                st.info(f"**Estimated Precision Cost:** ₹{max(est_cost, 50)}")
             else:
+                st.success("✅ The leaf appears healthy. Continue normal monitoring.")
                 st.balloons()
-                st.write("Crop is in optimal health!")
