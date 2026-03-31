@@ -30,30 +30,39 @@ class AppleDiagnostics:
         output = self.model(input_t)
         output[0, label_idx].backward()
         
-        # --- FIXED LOGIC START ---
-        # Get gradients and activations
-        grads = self.gradients.cpu().data.numpy()[0]
-        acts = self.activations.cpu().data.numpy()[0]
-        
-        # Pool the gradients (Global Average Pooling) to get weights per channel
+        # --- ROBUST DIMENSION HANDLING ---
+        # Ensure we have (C, H, W) by removing the batch dimension if present
+        grads = self.gradients.detach().cpu().numpy().squeeze()
+        acts = self.activations.detach().cpu().numpy().squeeze()
+
+        # Calculate Global Average Pooled gradients (Importance Weights)
+        # We average across the Spatial dimensions (H, W) which are indices 1 and 2
         weights = np.mean(grads, axis=(1, 2))
         
-        # Create Weighted Combination of Maps
+        # Create Heatmap: Weighted sum of all 1280 activation maps
         cam = np.zeros(acts.shape[1:], dtype=np.float32)
         for i, w in enumerate(weights):
             cam += w * acts[i, :, :]
             
-        # ReLU and Normalization
+        # ReLU Activation: Only keep features that contribute POSITIVELY to the class
         cam = np.maximum(cam, 0)
+        
+        # Normalize for visualization
         heatmap = cv2.resize(cam, (224, 224))
-        heatmap /= (heatmap.max() + 1e-8)
-        # --- FIXED LOGIC END ---
+        if heatmap.max() > 0:
+            heatmap /= heatmap.max()
+        # ----------------------------------
 
         img_np = np.array(img_pil.resize((224, 224)))
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+        # Masking the leaf (Green/Yellow range) to calculate severity
         leaf_mask = cv2.inRange(hsv, (5, 30, 30), (90, 255, 255))
-        disease_mask = (heatmap > 0.5).astype(np.uint8) * 255
-        severity = (np.sum(disease_mask > 0) / np.sum(leaf_mask > 0) * 100) if np.sum(leaf_mask > 0) > 0 else 0
+        disease_mask = (heatmap > 0.4).astype(np.uint8) * 255 # 0.4 is a more sensitive threshold
+        
+        leaf_area = np.sum(leaf_mask > 0)
+        disease_area = np.sum(np.bitwise_and(disease_mask > 0, leaf_mask > 0))
+        
+        severity = (disease_area / leaf_area * 100) if leaf_area > 0 else 0
         return heatmap, round(min(severity, 100.0), 2)
 
 # --- 2. APP UI ---
