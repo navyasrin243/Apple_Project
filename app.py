@@ -9,7 +9,7 @@ from torchvision import models, transforms
 import pandas as pd
 import os
 
-# --- 1. THE DIAGNOSTIC ENGINE (With Noise Suppression) ---
+# --- 1. THE DIAGNOSTIC ENGINE (With Noise & Edge Suppression) ---
 class AppleDiagnostics:
     def __init__(self, model, target_layer):
         self.model = model
@@ -22,7 +22,7 @@ class AppleDiagnostics:
     def analyze(self, img_pil, label_idx):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Tight crop to remove background edges seen in your screenshots
+        # Center-Crop to focus on leaf tissue, ignoring background noise
         w, h = img_pil.size
         img_cropped = img_pil.crop((w*0.1, h*0.1, w*0.9, h*0.9))
         
@@ -48,8 +48,7 @@ class AppleDiagnostics:
         cam = np.maximum(cam, 0)
         heatmap = cv2.resize(cam, (224, 224))
 
-        # --- FIX: GAUSSIAN CENTER MASK ---
-        # Forces the AI to ignore the background/corners
+        # GAUSSIAN MASK: Forces focus on center, removing corner artifacts
         Y, X = np.ogrid[:224, :224]
         center_mask = np.exp(-((X - 112)**2 + (Y - 112)**2) / (2 * 75**2))
         heatmap = heatmap * center_mask
@@ -57,7 +56,7 @@ class AppleDiagnostics:
         if heatmap.max() > 0:
             heatmap /= (heatmap.max() + 1e-8)
 
-        # Severity Calculation
+        # Severity Calculation using HSV Leaf Isolation
         img_np = np.array(img_cropped.resize((224, 224)))
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
         leaf_mask = cv2.inRange(hsv, (5, 30, 30), (90, 255, 255))
@@ -69,7 +68,7 @@ class AppleDiagnostics:
         
         return heatmap, round(min(severity, 100.0), 2), img_cropped
 
-# --- 2. LOADING ---
+# --- 2. LOGIC HELPERS ---
 @st.cache_resource
 def load_all():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -82,7 +81,7 @@ def load_all():
         return model, engine, device
     return None, None, None
 
-# --- 3. UI & BATCH PROCESSING ---
+# --- 3. MAIN UI ---
 st.set_page_config(page_title="AppleAI Pro Max", layout="wide")
 st.title("🍎 AppleAI: High-Precision Batch Pathologist")
 
@@ -91,10 +90,10 @@ model, engine, device = load_all()
 if model:
     CLASS_NAMES = ['black_rot', 'healthy', 'rust', 'scab']
     TREATMENT = {
-        "scab": {"med": "Captan 80 WDG", "price": 450},
-        "rust": {"med": "Myclobutanil", "price": 600},
-        "black_rot": {"med": "Mancozeb", "price": 550},
-        "healthy": {"med": "None", "price": 0}
+        "black_rot": {"med": "Mancozeb", "price": 550, "desc": "Prune dead wood."},
+        "healthy": {"med": "Nutritional Spray", "price": 0, "desc": "Maintain monitoring."},
+        "rust": {"med": "Myclobutanil", "price": 600, "desc": "Remove alternate hosts."},
+        "scab": {"med": "Captan 80 WDG", "price": 450, "desc": "Improve air flow."}
     }
 
     uploaded_files = st.file_uploader("📂 Upload Orchard Images", type=["jpg","png","jpeg"], accept_multiple_files=True)
@@ -110,37 +109,52 @@ if model:
                 out = model(input_inf)
                 probs = torch.softmax(out, 1)[0]
                 
-                # --- FIX: RUST SENSITIVITY OVERRIDE ---
-                # Prioritize Rust if probability is > 12%
-                if probs[2] > 0.12: 
-                    idx = 2
+                # --- TIE-BREAKER & SENSITIVITY LOGIC ---
+                p_rot, p_healthy, p_rust, p_scab = probs[0], probs[1], probs[2], probs[3]
+                
+                # 1. Primary Check: Is it a spotted disease? (Rust or Rot)
+                if (p_rust > 0.12 or p_rot > 0.12):
+                    # Decide between Rust and Black Rot based on probability dominance
+                    idx = 2 if p_rust > p_rot else 0
                 else:
                     idx = torch.max(out, 1)[1].item()
 
             heatmap, severity, cropped = engine.analyze(img, idx)
             label = CLASS_NAMES[idx]
             
+            # Final Safety: If severity is high but labeled healthy, force "EARLY ALERT"
+            if label == "healthy" and severity > 1.5:
+                label_display = "EARLY INFECTION"
+                med = "Preventative Fungicide"
+                cost = 300
+            else:
+                label_display = label.replace('_', ' ').upper()
+                med = TREATMENT[label]["med"]
+                cost = int(TREATMENT[label]["price"] * (severity/100))
+
             results.append({
                 "File": file.name,
-                "Diagnosis": label.replace('_', ' ').upper(),
+                "Diagnosis": label_display,
                 "Severity": f"{severity}%",
-                "Medicine": TREATMENT[label]["med"],
-                "Cost (₹)": int(TREATMENT[label]["price"] * (severity/100)),
+                "Medicine": med,
+                "Cost (₹)": cost,
                 "heatmap": heatmap, "img": cropped
             })
 
-        # --- 4. OUTPUTS ---
+        # --- 4. BATCH REPORT ---
         df = pd.DataFrame(results).drop(columns=['heatmap', 'img'])
         st.table(df)
-        st.metric("Total Treatment Cost", f"₹{df['Cost (₹)'].sum()}")
+        st.subheader(f"💰 Total Orchard Treatment Estimate: ₹{df['Cost (₹)'].sum()}")
 
-        st.subheader("🔍 Pathological Evidence")
+        # --- 5. GRAD-CAM EVIDENCE ---
+        st.divider()
+        st.subheader("🔍 Localized Pathological Evidence")
         cols = st.columns(min(len(results), 4))
         for i, res in enumerate(results):
             with cols[i % 4]:
                 img_np = np.array(res['img'].resize((224, 224)))
                 h_map = cv2.applyColorMap(np.uint8(255 * res['heatmap']), cv2.COLORMAP_JET)
                 overlay = cv2.addWeighted(img_np, 0.6, cv2.cvtColor(h_map, cv2.COLOR_BGR2RGB), 0.4, 0)
-                st.image(overlay, caption=f"{res['File']}: {res['Diagnosis']}")
+                st.image(overlay, caption=f"{res['Diagnosis']} ({res['File']})")
 else:
-    st.error("Please ensure 'model.pth' is in the directory.")
+    st.error("Model not found. Run training first.")
