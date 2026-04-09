@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import cv2
 import numpy as np
+import os
 from PIL import Image
 from torchvision import models, transforms
 
@@ -32,7 +33,6 @@ class AppleDiagnostics:
         heatmap = cv2.resize(cam, (224, 224))
         if heatmap.max() > 0: heatmap /= heatmap.max()
 
-        # Severity Logic
         img_np = np.array(img_224)
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
         leaf_mask = cv2.inRange(hsv, (5, 30, 30), (95, 255, 255))
@@ -54,54 +54,64 @@ AGRI_DB = {
 st.set_page_config(page_title="AppleAI Pro", layout="wide")
 st.sidebar.title("🔬 Research Controls")
 mode = st.sidebar.radio("Logic:", ["Focal Loss (Optimized)", "SMOTE (Balanced)"])
+
+# Dynamically find the path
 m_file = "model_focal.pth" if "Focal" in mode else "model_smote.pth"
 
 @st.cache_resource
 def load_sys(path):
+    # Check if file exists to prevent crash
+    if not os.path.exists(path):
+        return None, None, None
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.mobilenet_v2(weights=None)
     model.classifier[1] = nn.Linear(model.last_channel, 4)
-    try:
-        model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
-    except:
-        st.error(f"⚠️ Model file '{path}' missing! Please run training first.")
+    
+    # Load state dict
+    state_dict = torch.load(path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
     model.eval()
     return model, AppleDiagnostics(model, model.features[-1]), device
 
-try:
-    model, engine, device = load_sys(m_file)
-    CLASS_NAMES = ['black_rot', 'healthy', 'rust', 'scab']
-    st.title("🍎 AppleAI Pathological Assessment")
-    
-    file = st.file_uploader("Upload Leaf Image", type=["jpg", "png", "jpeg"])
-    if file:
-        img = Image.open(file).convert("RGB")
-        c1, c2, c3 = st.columns([1, 1, 1])
-        
-        # Inference
-        inf_tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
-        input_inf = inf_tf(img).unsqueeze(0).to(device)
-        with torch.no_grad():
-            idx = model(input_inf).argmax(1).item()
-            label = CLASS_NAMES[idx]
-        
-        heatmap, sev = engine.analyze(img, idx)
-        db = AGRI_DB[label]
-        cost = int(db['base'] * (sev/100 + 1)) if label != "healthy" else 0
+# Main Logic
+model, engine, device = load_sys(m_file)
 
-        with c1:
-            st.image(img, caption="Leaf Sample", use_container_width=True)
-            st.metric("Diagnosis", label.upper())
-        with c2:
-            img_224 = np.array(img.resize((224, 224)))
-            h_map = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
-            overlay = cv2.addWeighted(img_224, 0.6, cv2.cvtColor(h_map, cv2.COLOR_BGR2RGB), 0.4, 0)
-            st.image(overlay, caption="Grad-CAM Hotspots", use_container_width=True)
-        with c3:
-            st.subheader("📋 Report")
-            st.write(f"**Severity:** {sev}%")
-            st.write(f"**Medicine:** {db['med']}")
-            st.metric("Est. Cost", f"₹{cost}")
-            st.info(f"Tip: {db['info']}")
-except Exception as e:
-    st.info("System initializing... please ensure model files exist.")
+if model is None:
+    st.error(f"❌ Error: `{m_file}` not found in the repository root.")
+    st.write("Current directory files:", os.listdir("."))
+    st.stop()
+
+CLASS_NAMES = ['black_rot', 'healthy', 'rust', 'scab']
+st.title("🍎 AppleAI Pathological Assessment")
+
+file = st.file_uploader("Upload Leaf Image", type=["jpg", "png", "jpeg"])
+if file:
+    img = Image.open(file).convert("RGB")
+    c1, c2, c3 = st.columns([1, 1, 1])
+    
+    # Inference
+    inf_tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+    input_inf = inf_tf(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        idx = model(input_inf).argmax(1).item()
+        label = CLASS_NAMES[idx]
+    
+    heatmap, sev = engine.analyze(img, idx)
+    db = AGRI_DB[label]
+    cost = int(db['base'] * (sev/100 + 1)) if label != "healthy" else 0
+
+    with c1:
+        st.image(img, caption="Leaf Sample", use_container_width=True)
+        st.metric("Diagnosis", label.upper())
+    with c2:
+        img_224 = np.array(img.resize((224, 224)))
+        h_map = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(img_224, 0.6, cv2.cvtColor(h_map, cv2.COLOR_BGR2RGB), 0.4, 0)
+        st.image(overlay, caption="Grad-CAM Hotspots", use_container_width=True)
+    with c3:
+        st.subheader("📋 Report")
+        st.write(f"**Severity:** {sev}%")
+        st.write(f"**Medicine:** {db['med']}")
+        st.metric("Est. Cost", f"₹{cost}")
+        st.info(f"Tip: {db['info']}")
