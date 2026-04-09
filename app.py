@@ -1,21 +1,18 @@
-
 import streamlit as st
 import torch
 import torch.nn as nn
 import cv2
 import numpy as np
-import pandas as pd
 from PIL import Image
 from torchvision import models, transforms
 
-# --- 1. SCIENTIFIC DIAGNOSTIC ENGINE (XAI) ---
+# --- 1. XAI & SEVERITY ENGINE ---
 class AppleDiagnostics:
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
         self.gradients = None
         self.activations = None
-        # Register hooks for Grad-CAM (Ref: Selvaraju et al. 2017)
         self.target_layer.register_forward_hook(lambda m, i, o: setattr(self, 'activations', o))
         self.target_layer.register_full_backward_hook(lambda m, gi, go: setattr(self, 'gradients', go[0]))
 
@@ -27,118 +24,84 @@ class AppleDiagnostics:
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
         input_t = tf(img_224).unsqueeze(0).to(device)
-        
-        # 1. Grad-CAM Generation
         self.model.zero_grad()
         output = self.model(input_t)
         output[0, label_idx].backward()
-
         weights = np.mean(self.gradients.cpu().data.numpy()[0], axis=(1, 2))
         cam = np.maximum(np.dot(weights, self.activations.cpu().data.numpy()[0]), 0)
         heatmap = cv2.resize(cam, (224, 224))
         if heatmap.max() > 0: heatmap /= heatmap.max()
 
-        # 2. Mathematical Severity (FAO Percent Disease Index Logic)
+        # Severity Logic
         img_np = np.array(img_224)
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-        # Mask to isolate leaf (Green/Yellow/Brown range)
         leaf_mask = cv2.inRange(hsv, (5, 30, 30), (95, 255, 255))
-        # Mask to isolate disease from AI Heatmap
         disease_mask = (heatmap > 0.4).astype(np.uint8) * 255
-        
-        leaf_area = np.sum(leaf_mask > 0)
-        severity = (np.sum(disease_mask > 0) / leaf_area * 100) if leaf_area > 0 else 0
-        
+        leaf_pixels = np.sum(leaf_mask > 0)
+        disease_pixels = np.sum((disease_mask > 0) & (leaf_mask > 0))
+        severity = (disease_pixels / leaf_pixels * 100) if leaf_pixels > 0 else 0
         return heatmap, round(min(severity, 100.0), 2)
 
-# --- 2. STREAMLIT UI & AGRI-DATABASE ---
-st.set_page_config(page_title="AppleAI Pro", layout="wide")
-st.title("🍎 AppleAI: Automated Pathological Assessment")
-
-# Standardized Treatment Database (Based on IPM Guidelines)
+# --- 2. AGRI-DATABASE ---
 AGRI_DB = {
-    "scab": {
-        "med": "Captan 80 WDG", 
-        "base_price": 450, 
-        "desc": "Protective fungicide. Targeted at Venturia inaequalis."
-    },
-    "rust": {
-        "med": "Myclobutanil", 
-        "base_price": 600, 
-        "desc": "Systemic treatment. Advised: Remove nearby Juniper hosts."
-    },
-    "black_rot": {
-        "med": "Mancozeb", 
-        "base_price": 550, 
-        "desc": "Broad-spectrum control. Advised: Prune and burn cankers."
-    },
-    "healthy": {
-        "med": "N/A", 
-        "base_price": 0, 
-        "desc": "Continue standard irrigation and nutrient monitoring."
-    }
+    "black_rot": {"med": "Mancozeb", "base": 550, "info": "Prune cankers and apply fungicide."},
+    "healthy": {"med": "N/A", "base": 0, "info": "Monitor and maintain irrigation."},
+    "rust": {"med": "Myclobutanil", "base": 600, "info": "Remove nearby Red Cedar hosts."},
+    "scab": {"med": "Captan 80 WDG", "base": 450, "info": "Apply protective fungicide."}
 }
 
+# --- 3. UI SETUP ---
+st.set_page_config(page_title="AppleAI Pro", layout="wide")
+st.sidebar.title("🔬 Research Controls")
+mode = st.sidebar.radio("Logic:", ["Focal Loss (Optimized)", "SMOTE (Balanced)"])
+m_file = "model_focal.pth" if "Focal" in mode else "model_smote.pth"
+
 @st.cache_resource
-def load_all():
+def load_sys(path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.mobilenet_v2(weights=None)
     model.classifier[1] = nn.Linear(model.last_channel, 4)
-    model.load_state_dict(torch.load("model.pth", map_location=device))
+    try:
+        model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+    except:
+        st.error(f"⚠️ Model file '{path}' missing! Please run training first.")
     model.eval()
-    engine = AppleDiagnostics(model, model.features[-1])
-    return model, engine, device
+    return model, AppleDiagnostics(model, model.features[-1]), device
 
 try:
-    model, engine, device = load_all()
+    model, engine, device = load_sys(m_file)
     CLASS_NAMES = ['black_rot', 'healthy', 'rust', 'scab']
-
-    uploaded_files = st.file_uploader("Upload Orchard Samples", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
-
-    if uploaded_files:
-        results_data = []
+    st.title("🍎 AppleAI Pathological Assessment")
+    
+    file = st.file_uploader("Upload Leaf Image", type=["jpg", "png", "jpeg"])
+    if file:
+        img = Image.open(file).convert("RGB")
+        c1, c2, c3 = st.columns([1, 1, 1])
         
-        for file in uploaded_files:
-            img = Image.open(file).convert("RGB")
-            
-            # Prediction
-            inf_tf = transforms.Compose([transforms.Resize((224,224)), transforms.ToTensor()])
-            input_inf = inf_tf(img).unsqueeze(0).to(device)
-            with torch.no_grad():
-                out = model(input_inf)
-                idx = out.argmax(1).item()
-                label = CLASS_NAMES[idx]
-            
-            # Diagnostics
-            heatmap, severity = engine.analyze(img, idx)
-            info = AGRI_DB[label]
-            
-            # Economic Calculation (Cost = Base + Severity Factor)
-            total_cost = int(info['base_price'] * (severity/100 + 0.1)) if label != "healthy" else 0
+        # Inference
+        inf_tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+        input_inf = inf_tf(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            idx = model(input_inf).argmax(1).item()
+            label = CLASS_NAMES[idx]
+        
+        heatmap, sev = engine.analyze(img, idx)
+        db = AGRI_DB[label]
+        cost = int(db['base'] * (sev/100 + 1)) if label != "healthy" else 0
 
-            results_data.append({
-                "File": file.name,
-                "Diagnosis": label.upper(),
-                "Severity": f"{severity}%",
-                "Medicine": info['med'],
-                "Treatment Cost": f"₹{total_cost}",
-                "h": heatmap,
-                "img": img
-            })
-
-        # Display Summary Table
-        df = pd.DataFrame(results_data).drop(columns=['h', 'img'])
-        st.table(df)
-
-        # Display Visual Proofs
-        st.subheader("Diagnostic Proofs (Grad-CAM XAI)")
-        cols = st.columns(4)
-        for i, res in enumerate(results_data):
-            with cols[i%4]:
-                img_np = np.array(res['img'].resize((224, 224)))
-                h_map = cv2.applyColorMap(np.uint8(255 * res['h']), cv2.COLORMAP_JET)
-                overlay = cv2.addWeighted(img_np, 0.6, cv2.cvtColor(h_map, cv2.COLOR_BGR2RGB), 0.4, 0)
-                st.image(overlay, caption=f"{res['File']} - {res['Diagnosis']}")
-
+        with c1:
+            st.image(img, caption="Leaf Sample", use_container_width=True)
+            st.metric("Diagnosis", label.upper())
+        with c2:
+            img_224 = np.array(img.resize((224, 224)))
+            h_map = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+            overlay = cv2.addWeighted(img_224, 0.6, cv2.cvtColor(h_map, cv2.COLOR_BGR2RGB), 0.4, 0)
+            st.image(overlay, caption="Grad-CAM Hotspots", use_container_width=True)
+        with c3:
+            st.subheader("📋 Report")
+            st.write(f"**Severity:** {sev}%")
+            st.write(f"**Medicine:** {db['med']}")
+            st.metric("Est. Cost", f"₹{cost}")
+            st.info(f"Tip: {db['info']}")
 except Exception as e:
-    st.error(f"System Ready. Please upload files. (Error trace: {e})")
+    st.info("System initializing... please ensure model files exist.")
