@@ -1,147 +1,249 @@
+%%writefile app.py
+"""
+AppleAI Pro — Streamlit App
+Run with:  streamlit run app.py
+Requires:  model_best.pth in the same directory
+"""
+import os
+import cv2
+import numpy as np
 import streamlit as st
 import torch
 import torch.nn as nn
-import cv2
-import numpy as np
-import os
 from PIL import Image
 from torchvision import models, transforms
 
-# --- 1. XAI & SEVERITY ENGINE ---
-class AppleDiagnostics:
+
+# ── 1. Grad-CAM engine ────────────────────────────────────────
+class GradCAMEngine:
+    """
+    Grad-CAM with per-class severity thresholds.
+    Target: m.features[-1][0]  (ConvBNActivation inside the last
+    InvertedResidual block — NOT the Sequential wrapper, which
+    breaks hooks silently on some PyTorch versions).
+    """
+    # Empirically tuned per-class activation thresholds
+    THRESHOLDS = {
+        'black_rot': 0.50,
+        'rust'     : 0.38,
+        'scab'     : 0.45,
+        'healthy'  : 0.99,
+    }
+
     def __init__(self, model, target_layer):
-        self.model = model
-        self.target_layer = target_layer
-        self.gradients = None
+        self.model       = model
+        self.gradients   = None
         self.activations = None
-        # Hooks for capturing internal model behavior
-        self.target_layer.register_forward_hook(self.save_activation)
-        self.target_layer.register_full_backward_hook(self.save_gradient)
+        target_layer.register_forward_hook(self._save_act)
+        target_layer.register_full_backward_hook(self._save_grad)
 
-    def save_activation(self, model, input, output):
-        self.activations = output
+    def _save_act(self, _, __, out):        self.activations = out
+    def _save_grad(self, _, __, grad_out):  self.gradients   = grad_out[0]
 
-    def save_gradient(self, model, grad_input, grad_output):
-        self.gradients = grad_output[0]
-
-    def analyze(self, img_pil, label_idx):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(device)
-        
-        img_224 = img_pil.resize((224, 224))
+    def analyze(self, img_pil, label_idx, label_name):
+        device = next(self.model.parameters()).device
         tf = transforms.Compose([
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            transforms.Normalize([0.485, 0.456, 0.406],
+                                  [0.229, 0.224, 0.225]),
         ])
-        input_t = tf(img_224).unsqueeze(0).to(device)
-        
+        inp = tf(img_pil).unsqueeze(0).to(device)
+        inp.requires_grad_(True)
+
         self.model.zero_grad()
-        output = self.model(input_t)
-        output[0, label_idx].backward()
-        
-        # Grad-CAM Calculation
-        grads = self.gradients.detach().cpu().numpy()[0]
-        act = self.activations.detach().cpu().numpy()[0]
-        weights = np.maximum(np.mean(grads, axis=(1, 2)), 0)
-        
-        cam = np.zeros(act.shape[1:], dtype=np.float32)
-        for i, w in enumerate(weights):
-            cam += w * act[i, :, :]
-            
-        cam = np.maximum(cam, 0)
+        out = self.model(inp)
+        out[0, label_idx].backward()
+
+        # Grad-CAM: global-average-pool the gradients → weight the activations
+        grads   = self.gradients.detach().cpu().numpy()[0]   # (C,H,W)
+        acts    = self.activations.detach().cpu().numpy()[0] # (C,H,W)
+        weights = np.maximum(np.mean(grads, axis=(1, 2)), 0) # relu on weights
+        cam     = np.sum(weights[:, None, None] * acts, axis=0)
+        cam     = np.maximum(cam, 0)
+
         heatmap = cv2.resize(cam, (224, 224))
-        if heatmap.max() > 0: heatmap /= heatmap.max()
+        if heatmap.max() > 0:
+            heatmap /= heatmap.max()
 
-        # Severity Logic (Visual Analysis)
-        img_np = np.array(img_224)
-        hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-        # Masking leaf tissue to calculate percentage of infection
-        leaf_mask = cv2.inRange(hsv, (5, 30, 30), (95, 255, 255))
-        disease_mask = (heatmap > 0.4).astype(np.uint8) * 255
-        leaf_pixels = np.sum(leaf_mask > 0)
-        disease_pixels = np.sum((disease_mask > 0) & (leaf_mask > 0))
-        severity = (disease_pixels / leaf_pixels * 100) if leaf_pixels > 0 else 0
-        
-        return heatmap, round(min(severity, 100.0), 2)
+        # Severity: diseased pixels / total leaf pixels
+        img_np  = np.array(img_pil.resize((224, 224)))
+        hsv     = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+        leaf_mask    = cv2.inRange(hsv, (5, 30, 30), (95, 255, 255))
+        thr          = self.THRESHOLDS.get(label_name, 0.4)
+        disease_mask = (heatmap > thr).astype(np.uint8) * 255
+        leaf_px      = max(np.sum(leaf_mask > 0), 1)
+        disease_px   = np.sum((disease_mask > 0) & (leaf_mask > 0))
+        severity     = round(min(disease_px / leaf_px * 100, 100.0), 2)
 
-# --- 2. KNOWLEDGE BASE ---
+        return heatmap, severity
+
+
+# ── 2. Knowledge base ─────────────────────────────────────────
 AGRI_DB = {
-    "black_rot": {"med": "Mancozeb", "base": 550, "info": "Prune infected branches immediately. Apply copper-based fungicide."},
-    "healthy": {"med": "N/A", "base": 0, "info": "No pathology detected. Maintain current irrigation levels."},
-    "rust": {"med": "Myclobutanil", "base": 600, "info": "Fungal spores detected. Check for nearby Cedar/Juniper host trees."},
-    "scab": {"med": "Captan 80 WDG", "base": 450, "info": "Apple scab thrives in humidity. Increase airflow around the canopy."}
+    'black_rot': {
+        'med' : 'Mancozeb',
+        'base': 550,
+        'info': ('Prune infected branches immediately. '
+                 'Apply copper-based fungicide after pruning. '
+                 'Destroy all infected debris.'),
+    },
+    'healthy': {
+        'med' : 'N/A',
+        'base': 0,
+        'info': ('No pathology detected. '
+                 'Maintain current irrigation and fertilisation schedule.'),
+    },
+    'rust': {
+        'med' : 'Myclobutanil',
+        'base': 600,
+        'info': ('Fungal spores detected. '
+                 'Check for nearby Cedar or Juniper host trees. '
+                 'Apply protective fungicide before rain events.'),
+    },
+    'scab': {
+        'med' : 'Captan 80 WDG',
+        'base': 450,
+        'info': ('Apple scab thrives in humidity. '
+                 'Increase canopy airflow via selective pruning. '
+                 'Apply fungicide at green tip through petal fall.'),
+    },
 }
 
-# --- 3. UI LAYOUT ---
-st.set_page_config(page_title="AppleAI Pro", page_icon="🍎", layout="wide")
-st.title("🍎 AppleAI: Automated Pathological Assessment")
-st.markdown("🔍 *Integrated Computer Vision & Economic Estimator for Precision Agriculture*")
-st.divider()
+LABELS = ['black_rot', 'healthy', 'rust', 'scab']
 
+
+# ── 3. Cached model loader ────────────────────────────────────
 @st.cache_resource
-def load_assets(path):
-    if not os.path.exists(path): return None, None
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def load_model(path='model_best.pth'):
+    if not os.path.exists(path):
+        return None, None
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     m = models.mobilenet_v2(weights=None)
     m.classifier[1] = nn.Linear(m.last_channel, 4)
-    m.load_state_dict(torch.load(path, map_location=device, weights_only=True))
-    m.eval()
-    return m, AppleDiagnostics(m, m.features[-1])
+    m.load_state_dict(
+        torch.load(path, map_location=device, weights_only=True)
+    )
+    m.eval().to(device)
+    # FIX: hook ConvBNActivation inside last block, not the Sequential
+    engine = GradCAMEngine(m, m.features[-1][0])
+    return m, engine
 
-model, engine = load_assets("model_smote.pth")
+
+# ── 4. Page layout ────────────────────────────────────────────
+st.set_page_config(
+    page_title='AppleAI Pro',
+    page_icon='🍎',
+    layout='wide',
+)
+
+st.title('🍎 AppleAI Pro: Automated Pathological Assessment')
+st.caption('Integrated Computer Vision & Economic Estimator '
+           'for Precision Apple Agriculture')
+st.divider()
+
+model, engine = load_model()
 
 if model is None:
-    st.error("⚠️ Model file 'model_smote.pth' not found in root directory.")
+    st.error(
+        "⚠️ **model_best.pth not found.**  "
+        "Run the training notebook first, then re-launch this app."
+    )
     st.stop()
 
-# --- 4. EXECUTION ---
-file = st.file_uploader("Upload Leaf Specimen", type=["jpg", "png", "jpeg"])
+# ── 5. Sidebar ────────────────────────────────────────────────
+with st.sidebar:
+    st.header('ℹ️ About')
+    st.write(
+        'Model: **MobileNetV2** fine-tuned on PlantVillage + PlantDoc.  \n'
+        'XAI  : **Grad-CAM** lesion localisation.  \n'
+        'Classes: Black Rot | Healthy | Rust | Scab'
+    )
+    st.divider()
+    st.caption('Upload a clear photo of a single apple leaf.')
 
-if file:
-    img = Image.open(file).convert("RGB")
-    
-    # Pre-processing & Prediction
+# ── 6. File upload & inference ────────────────────────────────
+uploaded = st.file_uploader(
+    'Upload Leaf Specimen',
+    type=['jpg', 'jpeg', 'png'],
+    help='JPG or PNG, ideally 224×224 px or larger'
+)
+
+if uploaded:
+    img    = Image.open(uploaded).convert('RGB')
+    device = next(model.parameters()).device
+
     tf = transforms.Compose([
-        transforms.Resize((224, 224)), 
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        transforms.Normalize([0.485, 0.456, 0.406],
+                              [0.229, 0.224, 0.225]),
     ])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    input_t = tf(img).unsqueeze(0).to(device)
-    
+
     with torch.no_grad():
-        logits = model(input_t)
-        idx = torch.argmax(logits, 1).item()
-        conf = torch.softmax(logits, 1)[0][idx].item()
-    
-    labels = ['black_rot', 'healthy', 'rust', 'scab']
-    current_label = labels[idx]
-    heatmap, severity = engine.analyze(img, idx)
-    db = AGRI_DB[current_label]
-    cost = int(db['base'] * (severity/100 + 1)) if current_label != "healthy" else 0
+        logits   = model(tf(img).unsqueeze(0).to(device))
+        probs    = torch.softmax(logits, 1)[0].cpu().numpy()
+        idx      = int(probs.argmax())
+        conf     = float(probs[idx])
 
-    # UI COLUMNS
-    col1, col2, col3 = st.columns([1, 1, 1])
+    label    = LABELS[idx]
+    heatmap, severity = engine.analyze(img, idx, label)
+    db   = AGRI_DB[label]
+    cost = int(db['base'] * (severity / 100 + 1)) if label != 'healthy' else 0
 
-    with col1:
-        st.subheader("📸 Original Image")
+    # ── Columns ───────────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.subheader('📸 Original Leaf')
         st.image(img, use_container_width=True)
-        st.metric("Detection", current_label.upper())
-        st.progress(conf, text=f"Confidence: {conf*100:.1f}%")
+        st.metric('Diagnosis', label.replace('_', ' ').title())
+        st.progress(conf, text=f'Confidence: {conf*100:.1f}%')
 
-    with col2:
-        st.subheader("🔬 Grad-CAM Heatmap")
-        img_np = np.array(img.resize((224, 224)))
-        h_map_color = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(img_np, 0.6, cv2.cvtColor(h_map_color, cv2.COLOR_BGR2RGB), 0.4, 0)
-        st.image(overlay, use_container_width=True, caption="Lesion Localization")
-        st.write(f"**Severity Index:** {severity}%")
+        # All-class probability bar chart
+        import matplotlib.pyplot as _plt
+        fig, ax = _plt.subplots(figsize=(4, 2.5))
+        colors  = ['#e74c3c' if i == idx else '#95a5a6'
+                   for i in range(4)]
+        ax.barh(LABELS, probs * 100, color=colors)
+        ax.set_xlabel('Probability (%)')
+        ax.set_title('Class Probabilities')
+        ax.set_xlim(0, 100)
+        _plt.tight_layout()
+        st.pyplot(fig)
 
-    with col3:
-        st.subheader("📋 Analysis Summary")
-        st.metric("Estimated Cost", f"₹{cost}")
-        st.write(f"**Recommended Medicine:** {db['med']}")
-        st.info(f"**Agri-Expert Note:** {db['info']}")
-        
-        # Summary Box
-        st.success(f"Final Assessment: {current_label.replace('_', ' ').title()} detected with {conf*100:.1f}% confidence. Recommended treatment with {db['med']} is expected to cost approximately ₹{cost}.")
+    with c2:
+        st.subheader('🔬 Grad-CAM Heatmap')
+        img_np     = np.array(img.resize((224, 224)))
+        heat_color = cv2.applyColorMap(
+            np.uint8(255 * heatmap), cv2.COLORMAP_JET
+        )
+        overlay = cv2.addWeighted(
+            img_np, 0.6,
+            cv2.cvtColor(heat_color, cv2.COLOR_BGR2RGB), 0.4, 0
+        )
+        st.image(overlay, caption='Lesion Localisation',
+                 use_container_width=True)
+
+        sev_color = (
+            '🟢' if severity < 20 else
+            '🟡' if severity < 50 else '🔴'
+        )
+        st.metric('Severity Index', f'{severity}%',
+                  delta=sev_color, delta_color='off')
+
+    with c3:
+        st.subheader('📋 Treatment Plan')
+        st.metric('Estimated Treatment Cost', f'₹ {cost:,}')
+        st.write(f'**Recommended Fungicide:** {db["med"]}')
+        st.info(f'🌿 **Expert Note:** {db["info"]}')
+        st.divider()
+        if label == 'healthy':
+            st.success('✅ Leaf is healthy. No treatment required.')
+        else:
+            st.warning(
+                f'⚠️ **{label.replace("_"," ").title()}** detected  \n'
+                f'Confidence: {conf*100:.1f}%  \n'
+                f'Severity: {severity}%  \n'
+                f'Treat with **{db["med"]}** — est. cost **₹ {cost:,}**'
+            )
