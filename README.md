@@ -414,15 +414,7 @@ scheduler = ReduceLROnPlateau(optimizer, mode='max', patience=3, factor=0.5)
 
 ---
 
-## Team
 
-| Name | Roll No | Contribution |
-|------|---------|-------------|
-| **Akula Navya Sri** | 21BSD7016 | Literature survey, dataset pipeline, image validation |
-| **Shaik Rubeena** | 21BSD7017 | Model training, evaluation, metrics, early stopping |
-| **Gottam Uday Kiran** | 21BSD7018 | Grad-CAM engine, severity scoring, Streamlit UI, deployment |
-
-> Department of Computer Science — SDP Final Review, May 2026
 
 ---
 
